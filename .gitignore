@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.es_data/
+.kafka_data/
+.zookeeper_data/
+reports/
+.idea/
+.vscode/
+.DS_Store
