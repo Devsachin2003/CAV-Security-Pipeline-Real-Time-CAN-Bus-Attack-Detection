@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import signal
 import time
 from collections import Counter, defaultdict, deque
@@ -29,8 +30,8 @@ from sklearn.preprocessing import StandardScaler
 
 
 DEFAULT_TOPIC = "can-telematics"
-DEFAULT_BOOTSTRAP_SERVERS = "localhost:9092"
-DEFAULT_ELASTICSEARCH_URL = "http://localhost:9200"
+DEFAULT_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+DEFAULT_ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 DEFAULT_INDEX = "can-security-alerts"
 MIN_STABLE_WARMUP_BUS_FREQUENCY = 100.0
 BASELINE_MIN_TIMING_SAMPLES = 30
@@ -40,6 +41,10 @@ REPLAY_REPEAT_WINDOW_NS = 3_000_000_000
 REPLAY_REPEAT_MIN_COUNT = 4
 REPLAY_COMPOSITE_THRESHOLD = 0.30
 RARE_REPLAY_COMPOSITE_FLOOR = 0.25
+MODEL_SEVERE_SCORE_THRESHOLD = -0.08
+PAYLOAD_SEQUENCE_LENGTH = 3
+PAYLOAD_SEQUENCE_REPEAT_MIN_COUNT = 2
+PAYLOAD_SEQUENCE_TIGHT_TIMING_RATIO = 0.65
 
 ARBITRATION_ID_MAP = {
     "0x000": 0,
@@ -125,6 +130,9 @@ class CAVIsolationForestDetector:
         self.payload_events: Deque[Tuple[int, str]] = deque(maxlen=10000)
         self.payload_seen_by_id: Dict[Tuple[str, str], int] = {}
         self.payload_times_by_id_signature: Dict[Tuple[str, str], Deque[int]] = defaultdict(lambda: deque(maxlen=200))
+        self.payload_sequence_by_id: Dict[str, Deque[str]] = defaultdict(lambda: deque(maxlen=PAYLOAD_SEQUENCE_LENGTH))
+        self.payload_sequence_times_by_id: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=PAYLOAD_SEQUENCE_LENGTH))
+        self.payload_ngram_seen_by_id: Dict[Tuple[str, Tuple[str, ...]], Deque[int]] = defaultdict(lambda: deque(maxlen=100))
         self.replay_suspicion_by_id: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=1000))
         self.transition_counts: Dict[str, Counter] = defaultdict(Counter)
         self.transition_totals: Counter = Counter()
@@ -138,6 +146,47 @@ class CAVIsolationForestDetector:
         self.consumer = self._connect_consumer(bootstrap_servers, topic, consumer_group, auto_offset_reset)
         self.es = self._connect_elasticsearch(elasticsearch_url)
         self._ensure_index()
+
+    @staticmethod
+    def _kafka_security_config() -> Dict[str, Any]:
+        config: Dict[str, Any] = {
+            "security_protocol": "SASL_SSL",
+            "sasl_mechanism": "PLAIN",
+            "sasl_plain_username": os.getenv("KAFKA_USER"),
+            "sasl_plain_password": os.getenv("KAFKA_PASSWORD"),
+        }
+        ca_cert_path = os.getenv("KAFKA_CA_CERT_PATH")
+        if ca_cert_path:
+            config["ssl_cafile"] = ca_cert_path
+
+        missing = [key for key in ("sasl_plain_username", "sasl_plain_password") if not config.get(key)]
+        if missing:
+            raise RuntimeError(
+                "Kafka SASL_SSL requires KAFKA_USER and KAFKA_PASSWORD environment variables."
+            )
+        return config
+
+    @staticmethod
+    def _elasticsearch_config(url: str) -> Dict[str, Any]:
+        config: Dict[str, Any] = {
+            "hosts": url,
+            "request_timeout": 30,
+            "retry_on_timeout": True,
+            "max_retries": 5,
+        }
+        elastic_user = os.getenv("ELASTIC_USER")
+        elastic_password = os.getenv("ELASTIC_PASSWORD")
+        if elastic_user and elastic_password:
+            config["basic_auth"] = (elastic_user, elastic_password)
+
+        ca_cert_path = os.getenv("ES_CA_CERT_PATH")
+        if ca_cert_path and url.lower().startswith("https://"):
+            config["ca_certs"] = ca_cert_path
+            config["verify_certs"] = True
+        elif url.lower().startswith("http://"):
+            config["verify_certs"] = False
+
+        return config
 
     @staticmethod
     def _connect_consumer(
@@ -154,10 +203,11 @@ class CAVIsolationForestDetector:
                     bootstrap_servers=bootstrap_servers,
                     group_id=consumer_group,
                     auto_offset_reset=auto_offset_reset,
-                    enable_auto_commit=True,
+                    enable_auto_commit=False,
                     value_deserializer=lambda payload: json.loads(payload.decode("utf-8")),
                     consumer_timeout_ms=1000,
                     max_poll_records=500,
+                    **CAVIsolationForestDetector._kafka_security_config(),
                 )
                 logging.info("Connected Kafka consumer to %s topic=%s", bootstrap_servers, topic)
                 return consumer
@@ -169,7 +219,7 @@ class CAVIsolationForestDetector:
 
     @staticmethod
     def _connect_elasticsearch(url: str) -> Elasticsearch:
-        es = Elasticsearch(url, request_timeout=30, retry_on_timeout=True, max_retries=5)
+        es = Elasticsearch(**CAVIsolationForestDetector._elasticsearch_config(url))
         for attempt in range(1, 31):
             try:
                 if es.ping():
@@ -191,7 +241,11 @@ class CAVIsolationForestDetector:
                     "arbitration_id": {"type": "keyword"},
                     "attack_type_label": {"type": "keyword"},
                     "detector_phase": {"type": "keyword"},
-                    "is_anomaly": {"type": "integer"},
+                    "is_anomaly": {"type": "boolean"},
+                    "anomaly_prediction": {"type": "integer"},
+                    "model_flag": {"type": "boolean"},
+                    "rule_flag": {"type": "boolean"},
+                    "decision_reasons": {"type": "keyword"},
                     "anomaly_score": {"type": "float"},
                     "pipeline_latency_ms": {"type": "float"},
                     "payload": {"type": "object", "enabled": True},
@@ -366,6 +420,7 @@ class CAVIsolationForestDetector:
         payload_signature: str,
         now_ns: int,
         timing_features: Dict[str, float],
+        interarrival_ms: float,
     ) -> Dict[str, float]:
         signature_key = (arbitration_id, payload_signature)
         signature_times = self.payload_times_by_id_signature[signature_key]
@@ -383,10 +438,70 @@ class CAVIsolationForestDetector:
             timing_score = max(timing_score, 0.65)
 
         composite_score = repeat_score * timing_score
+        sequence_features = self._payload_sequence_features(
+            arbitration_id,
+            payload_signature,
+            now_ns,
+            interarrival_ms,
+            timing_features,
+        )
         return {
             "payload_signature_repeats_3s": float(repeat_count_3s),
             "payload_repeat_score": float(repeat_score),
             "payload_timing_replay_score": float(composite_score),
+            **sequence_features,
+        }
+
+    def _payload_sequence_features(
+        self,
+        arbitration_id: str,
+        payload_signature: str,
+        now_ns: int,
+        interarrival_ms: float,
+        timing_features: Dict[str, float],
+    ) -> Dict[str, float]:
+        sequence = self.payload_sequence_by_id[arbitration_id]
+        sequence_times = self.payload_sequence_times_by_id[arbitration_id]
+        sequence.append(payload_signature)
+        sequence_times.append(now_ns)
+
+        if len(sequence) < PAYLOAD_SEQUENCE_LENGTH:
+            return {
+                "payload_sequence_repeat_count": 0.0,
+                "payload_sequence_age_ms": 0.0,
+                "payload_sequence_tight_timing_flag": 0.0,
+                "payload_sequence_replay_score": 0.0,
+            }
+
+        sequence_key = tuple(sequence)
+        seen_key = (arbitration_id, sequence_key)
+        seen_times = self.payload_ngram_seen_by_id[seen_key]
+        previous_seen_ns = seen_times[-1] if seen_times else None
+        seen_times.append(now_ns)
+
+        repeat_count = max(0, len(seen_times) - 1)
+        age_ms = 0.0 if previous_seen_ns is None else (now_ns - previous_seen_ns) / 1_000_000.0
+        baseline = self.timing_baseline_by_id.get(arbitration_id, {})
+        baseline_median_ms = float(baseline.get("median", 0.0))
+        tighter_than_baseline = (
+            baseline_median_ms > 0.0
+            and interarrival_ms > 0.0
+            and interarrival_ms <= baseline_median_ms * PAYLOAD_SEQUENCE_TIGHT_TIMING_RATIO
+        )
+        tight_timing = bool(tighter_than_baseline or timing_features["iat_drop_flag"] or timing_features["iat_exactness_flag"])
+        replay_score = 0.0
+        if repeat_count >= PAYLOAD_SEQUENCE_REPEAT_MIN_COUNT:
+            replay_score += 0.45
+        if repeat_count >= PAYLOAD_SEQUENCE_REPEAT_MIN_COUNT and tight_timing:
+            replay_score += 0.45
+        if repeat_count >= 1 and timing_features["timing_anomaly_score"] >= 0.65:
+            replay_score += 0.25
+
+        return {
+            "payload_sequence_repeat_count": float(repeat_count),
+            "payload_sequence_age_ms": float(age_ms),
+            "payload_sequence_tight_timing_flag": 1.0 if tight_timing else 0.0,
+            "payload_sequence_replay_score": float(min(1.0, replay_score)),
         }
 
     def _state_transition_features(
@@ -508,7 +623,13 @@ class CAVIsolationForestDetector:
         interarrivals = np.array(self.interarrivals_by_id[arbitration_id], dtype=float)
         arbitration_id_numeric = self._parse_arbitration_id(arbitration_id)
         timing_features = self._timing_rhythm_features(arbitration_id, interarrival_ms)
-        payload_repeat_features = self._payload_repeat_features(arbitration_id, payload_signature, now_ns, timing_features)
+        payload_repeat_features = self._payload_repeat_features(
+            arbitration_id,
+            payload_signature,
+            now_ns,
+            timing_features,
+            interarrival_ms,
+        )
 
         features = {
             "interarrival_ms": interarrival_ms,
@@ -531,12 +652,22 @@ class CAVIsolationForestDetector:
         features.update(payload_repeat_features)
         return features
 
+    @staticmethod
+    def _event_time_ns(frame: Dict[str, Any]) -> int:
+        send_time_ns = frame.get("simulator_send_time_ns")
+        if isinstance(send_time_ns, int):
+            return send_time_ns
+        event_time_epoch_ms = frame.get("event_time_epoch_ms")
+        if isinstance(event_time_epoch_ms, int):
+            return event_time_epoch_ms * 1_000_000
+        return time.time_ns()
+
     def extract_features(self, frame: Dict[str, Any]) -> Dict[str, float]:
         payload = frame.get("payload", {})
         if not isinstance(payload, dict):
             payload = {}
 
-        now_ns = time.time_ns()
+        now_ns = self._event_time_ns(frame)
         arbitration_id = str(frame.get("arbitration_id", ""))
         traffic_features = self._traffic_features(arbitration_id, payload, now_ns)
         raw_byte_mean, raw_byte_std = self._raw_byte_stats(payload)
@@ -586,6 +717,24 @@ class CAVIsolationForestDetector:
         return prediction, score
 
     @staticmethod
+    def _model_flag(model_prediction: int, anomaly_score: float) -> bool:
+        return model_prediction == -1 and anomaly_score <= MODEL_SEVERE_SCORE_THRESHOLD
+
+    @staticmethod
+    def check_replay_anomaly(features: Dict[str, float]) -> Optional[str]:
+        if features["payload_sequence_replay_score"] >= 0.80:
+            return "payload_ngram_replay_tight_timing"
+        if features["payload_sequence_repeat_count"] >= 3 and features["payload_sequence_tight_timing_flag"]:
+            return "repeated_payload_sequence_tight_timing"
+        if (
+            features["payload_sequence_repeat_count"] >= PAYLOAD_SEQUENCE_REPEAT_MIN_COUNT
+            and features["rare_transition_flag"]
+            and features["timing_anomaly_score"] >= 0.5
+        ):
+            return "payload_sequence_rare_transition_replay"
+        return None
+
+    @staticmethod
     def apply_security_rules(frame: Dict[str, Any], features: Dict[str, float]) -> Tuple[List[str], float]:
         payload = frame.get("payload", {})
         if not isinstance(payload, dict):
@@ -632,6 +781,9 @@ class CAVIsolationForestDetector:
             and features["payload_timing_replay_score"] >= RARE_REPLAY_COMPOSITE_FLOOR
         ):
             rules.append("rare_sequence_replay_timing")
+        replay_rule = CAVIsolationForestDetector.check_replay_anomaly(features)
+        if replay_rule:
+            rules.append(replay_rule)
         if features["state_transition_violation_score"] >= 0.5:
             rules.append("physics_state_transition_violation")
 
@@ -648,6 +800,12 @@ class CAVIsolationForestDetector:
     def process_frame(self, frame: Dict[str, Any]) -> Dict[str, Any]:
         features = self.extract_features(frame)
         vector = self.vectorize(features)
+        model_prediction = 1
+        score = 0.0
+        triggered_rules: List[str] = []
+        rule_score = 0.0
+        model_flag = False
+        rule_flag = False
 
         if not self.is_model_ready:
             is_normal = str(frame.get("attack_type_label", "normal")) == "normal"
@@ -657,30 +815,44 @@ class CAVIsolationForestDetector:
                 self.warmup_vectors.append(vector)
             if len(self.warmup_vectors) >= self.warmup_samples:
                 self.fit_model()
-            prediction = 1
-            score = 0.0
             phase = "warmup"
         else:
             model_prediction, score = self.infer(vector)
             triggered_rules, rule_score = self.apply_security_rules(frame, features)
-            prediction = -1 if triggered_rules else 1
+            model_flag = self._model_flag(model_prediction, score)
+            rule_flag = bool(triggered_rules)
             phase = "inference"
+
+        is_anomaly = model_flag or rule_flag
+        anomaly_prediction = -1 if is_anomaly else 1
+        decision_reasons = []
+        if model_flag:
+            decision_reasons.append("isolation_forest_severe_anomaly")
+        decision_reasons.extend(triggered_rules)
 
         enriched = dict(frame)
         enriched.update(
             {
                 "detector_timestamp": datetime.now(timezone.utc).isoformat(),
                 "detector_phase": phase,
-                "is_anomaly": prediction,
-                "model_prediction": prediction if phase == "warmup" else model_prediction,
+                "is_anomaly": is_anomaly,
+                "anomaly_prediction": anomaly_prediction,
+                "model_prediction": model_prediction,
+                "model_flag": model_flag,
                 "anomaly_score": score,
-                "rule_score": 0.0 if phase == "warmup" else rule_score,
-                "triggered_rules": [] if phase == "warmup" else triggered_rules,
+                "rule_flag": rule_flag,
+                "rule_score": rule_score,
+                "rule_flags": triggered_rules,
+                "triggered_rules": triggered_rules,
+                "decision_reasons": decision_reasons,
                 "features": features,
                 "pipeline_latency_ms": self._pipeline_latency_ms(frame),
             }
         )
         return enriched
+
+    def process_can_frame(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+        return self.process_frame(frame)
 
     def enqueue_for_indexing(self, record: Dict[str, Any]) -> None:
         document_id = f"{record.get('session_id')}:{record.get('sequence')}:{record.get('arbitration_id')}:{time.time_ns()}"
@@ -724,12 +896,15 @@ class CAVIsolationForestDetector:
                     self.enqueue_for_indexing(enriched)
 
                     self.stats["processed"] += 1
-                    if enriched["is_anomaly"] == -1:
+                    if enriched["is_anomaly"]:
                         self.stats["anomalies"] += 1
                     last_log_time = self.log_metrics(last_log_time)
+                self.flush_bulk()
+                self.consumer.commit()
         finally:
             logging.info("Detector stopping; flushing remaining Elasticsearch records.")
             self.flush_bulk()
+            self.consumer.commit()
             self.consumer.close()
             self.es.close()
 

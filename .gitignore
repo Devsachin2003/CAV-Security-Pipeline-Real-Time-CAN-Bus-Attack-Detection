@@ -3,6 +3,7 @@ venv/
 __pycache__/
 *.py[cod]
 .env
+.kafka_secrets/
 .es_data/
 .kafka_data/
 .zookeeper_data/

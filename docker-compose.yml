@@ -6,8 +6,8 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
+    expose:
+      - "2181"
     volumes:
       - ./.zookeeper_data:/var/lib/zookeeper/data
 
@@ -18,25 +18,55 @@ services:
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092"
+      - "127.0.0.1:${KAFKA_HOST_PORT:-9092}:9093"
+    expose:
+      - "29093"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: EXTERNAL:SASL_SSL,INTERNAL:SASL_SSL
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:${KAFKA_HOST_PORT:-9092},INTERNAL://kafka:29093
+      KAFKA_LISTENERS: EXTERNAL://0.0.0.0:9093,INTERNAL://0.0.0.0:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_BROKER_USER: "${KAFKA_BROKER_USER}"
+      KAFKA_BROKER_PASSWORD: "${KAFKA_BROKER_PASSWORD}"
+      KAFKA_USER: "${KAFKA_USER}"
+      KAFKA_PASSWORD: "${KAFKA_PASSWORD}"
+      KAFKA_SSL_TRUSTSTORE_PASSWORD: "${KAFKA_SSL_TRUSTSTORE_PASSWORD}"
+      KAFKA_OPTS: "-Dzookeeper.sasl.client=false"
+      KAFKA_ZOOKEEPER_CLIENT_SASL_ENABLED: "false"
+      KAFKA_ZOOKEEPER_SET_ACL: "false"
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_BROKER_USER}" password="${KAFKA_BROKER_PASSWORD}" user_${KAFKA_BROKER_USER}="${KAFKA_BROKER_PASSWORD}" user_${KAFKA_USER}="${KAFKA_PASSWORD}";
+      KAFKA_LISTENER_NAME_INTERNAL_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_BROKER_USER}" password="${KAFKA_BROKER_PASSWORD}" user_${KAFKA_BROKER_USER}="${KAFKA_BROKER_PASSWORD}" user_${KAFKA_USER}="${KAFKA_PASSWORD}";
+      KAFKA_SSL_KEYSTORE_FILENAME: kafka.server.keystore.jks
+      KAFKA_SSL_KEYSTORE_LOCATION: /etc/kafka/secrets/kafka.server.keystore.jks
+      KAFKA_SSL_KEYSTORE_PASSWORD: "${KAFKA_SSL_KEYSTORE_PASSWORD}"
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: kafka_keystore_creds
+      KAFKA_SSL_KEY_PASSWORD: "${KAFKA_SSL_KEY_PASSWORD}"
+      KAFKA_SSL_KEY_CREDENTIALS: kafka_key_creds
+      KAFKA_SSL_TRUSTSTORE_FILENAME: kafka.server.truststore.jks
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /etc/kafka/secrets/kafka.server.truststore.jks
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: kafka_truststore_creds
+      KAFKA_SSL_CLIENT_AUTH: none
+      KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: HTTPS
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_LOG_RETENTION_HOURS: 24
       KAFKA_CREATE_TOPICS: "can-telematics:3:1"
     volumes:
       - ./.kafka_data:/var/lib/kafka/data
+      - ./.kafka_secrets:/etc/kafka/secrets:ro
     healthcheck:
-      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      test:
+        [
+          "CMD-SHELL",
+          "printf '%s\n' 'security.protocol=SASL_SSL' 'sasl.mechanism=PLAIN' \"sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\\\"$${KAFKA_USER}\\\" password=\\\"$${KAFKA_PASSWORD}\\\";\" 'ssl.truststore.location=/etc/kafka/secrets/kafka.server.truststore.jks' \"ssl.truststore.password=$${KAFKA_SSL_TRUSTSTORE_PASSWORD}\" > /tmp/kafka-client.properties && kafka-topics --bootstrap-server kafka:29093 --command-config /tmp/kafka-client.properties --list"
+        ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -46,32 +76,57 @@ services:
     container_name: cav-elasticsearch
     restart: unless-stopped
     ports:
-      - "9200:9200"
+      - "127.0.0.1:${ELASTICSEARCH_HOST_PORT:-9200}:9200"
     environment:
       discovery.type: single-node
-      xpack.security.enabled: "false"
-      xpack.security.http.ssl.enabled: "false"
-      xpack.security.transport.ssl.enabled: "false"
+      xpack.security.enabled: "true"
+      ELASTIC_PASSWORD: "${ELASTIC_PASSWORD}"
       ES_JAVA_OPTS: "-Xms1g -Xmx1g"
     volumes:
       - ./.es_data:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -u elastic:$${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health || exit 1"
+        ]
       interval: 10s
       timeout: 5s
       retries: 20
+
+  elasticsearch-setup:
+    image: curlimages/curl:8.8.0
+    container_name: cav-elasticsearch-setup
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      ELASTIC_PASSWORD: "${ELASTIC_PASSWORD}"
+      KIBANA_SYSTEM_PASSWORD: "${KIBANA_SYSTEM_PASSWORD}"
+    command:
+      [
+        "sh",
+        "-c",
+        "curl -fsS -u elastic:$${ELASTIC_PASSWORD} -H 'Content-Type: application/json' -X POST http://elasticsearch:9200/_security/user/kibana_system/_password -d '{\"password\":\"'$${KIBANA_SYSTEM_PASSWORD}'\"}'"
+      ]
 
   kibana:
     image: docker.elastic.co/kibana/kibana:8.14.1
     container_name: cav-kibana
     restart: unless-stopped
     depends_on:
-      - elasticsearch
+      elasticsearch:
+        condition: service_healthy
+      elasticsearch-setup:
+        condition: service_completed_successfully
     ports:
-      - "5601:5601"
+      - "127.0.0.1:${KIBANA_HOST_PORT:-5601}:5601"
     environment:
       ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
-      XPACK_SECURITY_ENABLED: "false"
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: "${KIBANA_SYSTEM_PASSWORD}"
+      XPACK_SECURITY_ENABLED: "true"
       TELEMETRY_ENABLED: "false"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status || exit 1"]

@@ -1,0 +1,5 @@
+kafka-python-ng
+scikit-learn
+elasticsearch>=8.14,<9
+numpy
+pandas

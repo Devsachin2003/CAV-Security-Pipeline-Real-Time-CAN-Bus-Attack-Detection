@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import random
 import signal
 import time
@@ -27,7 +28,7 @@ from kafka.errors import KafkaError, NoBrokersAvailable
 
 
 DEFAULT_TOPIC = "can-telematics"
-DEFAULT_BOOTSTRAP_SERVERS = "localhost:9092"
+DEFAULT_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
 ENGINE_ID = "0x110"
 BRAKE_ID = "0x220"
@@ -101,6 +102,25 @@ class CANTelematicsSimulator:
         self.producer = self._connect_producer(bootstrap_servers, producer_client_id)
 
     @staticmethod
+    def _kafka_security_config() -> Dict[str, Any]:
+        config: Dict[str, Any] = {
+            "security_protocol": "SASL_SSL",
+            "sasl_mechanism": "PLAIN",
+            "sasl_plain_username": os.getenv("KAFKA_USER"),
+            "sasl_plain_password": os.getenv("KAFKA_PASSWORD"),
+        }
+        ca_cert_path = os.getenv("KAFKA_CA_CERT_PATH")
+        if ca_cert_path:
+            config["ssl_cafile"] = ca_cert_path
+
+        missing = [key for key in ("sasl_plain_username", "sasl_plain_password") if not config.get(key)]
+        if missing:
+            raise RuntimeError(
+                "Kafka SASL_SSL requires KAFKA_USER and KAFKA_PASSWORD environment variables."
+            )
+        return config
+
+    @staticmethod
     def _connect_producer(bootstrap_servers: str, client_id: str) -> KafkaProducer:
         last_error: Optional[BaseException] = None
         for attempt in range(1, 31):
@@ -114,6 +134,7 @@ class CANTelematicsSimulator:
                     linger_ms=5,
                     retries=5,
                     max_in_flight_requests_per_connection=1,
+                    **CANTelematicsSimulator._kafka_security_config(),
                 )
                 logging.info("Connected to Kafka at %s", bootstrap_servers)
                 return producer
@@ -330,12 +351,14 @@ class CANTelematicsSimulator:
 
         last_log_time = time.monotonic()
         frames_sent = 0
+        total_frames_sent = 0
 
         while self.running:
             cycle_start = time.monotonic()
             for frame in self.frames_for_current_mode():
                 self.publish(frame)
                 frames_sent += 1
+                total_frames_sent += 1
             self.tick += 1
 
             if time.monotonic() - last_log_time >= 5:
@@ -349,6 +372,7 @@ class CANTelematicsSimulator:
 
         logging.info("Stopping simulator and flushing producer.")
         self.producer.flush(timeout=10)
+        logging.info("Total frames published: %d; mode=%s", total_frames_sent, self.attack_mode)
         self.producer.close(timeout=10)
 
 

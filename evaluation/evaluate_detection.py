@@ -6,7 +6,7 @@ The simulator provides ground-truth labels in attack_type_label:
 normal = benign, all other labels = attack.
 
 The detector prediction is stored in is_anomaly:
-1 = normal, -1 = anomaly.
+true = anomaly, false = normal.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -21,9 +22,26 @@ from typing import Any, Dict, Iterable, List, Optional
 from elasticsearch import Elasticsearch
 
 
-DEFAULT_ELASTICSEARCH_URL = "http://localhost:9200"
+DEFAULT_ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 DEFAULT_INDEX = "can-security-alerts*"
 ATTACK_TYPES = ["fuzz", "replay", "injection", "dos"]
+
+
+def elasticsearch_config(url: str) -> Dict[str, Any]:
+    config: Dict[str, Any] = {"hosts": url, "request_timeout": 30}
+    elastic_user = os.getenv("ELASTIC_USER")
+    elastic_password = os.getenv("ELASTIC_PASSWORD")
+    if elastic_user and elastic_password:
+        config["basic_auth"] = (elastic_user, elastic_password)
+
+    ca_cert_path = os.getenv("ES_CA_CERT_PATH")
+    if ca_cert_path and url.lower().startswith("https://"):
+        config["ca_certs"] = ca_cert_path
+        config["verify_certs"] = True
+    elif url.lower().startswith("http://"):
+        config["verify_certs"] = False
+
+    return config
 
 
 def count_documents(es: Elasticsearch, index: str, filters: Iterable[Dict[str, Any]]) -> int:
@@ -75,12 +93,12 @@ def evaluate(es: Elasticsearch, index: str, start_time: Optional[str], end_time:
     normal_anomalies = count_documents(
         es,
         index,
-        [*time_filters, term_filter("attack_type_label", "normal"), term_filter("is_anomaly", -1)],
+        [*time_filters, term_filter("attack_type_label", "normal"), term_filter("is_anomaly", True)],
     )
     normal_predicted_normal = count_documents(
         es,
         index,
-        [*time_filters, term_filter("attack_type_label", "normal"), term_filter("is_anomaly", 1)],
+        [*time_filters, term_filter("attack_type_label", "normal"), term_filter("is_anomaly", False)],
     )
 
     per_attack: Dict[str, Dict[str, Any]] = {}
@@ -92,12 +110,12 @@ def evaluate(es: Elasticsearch, index: str, start_time: Optional[str], end_time:
         true_positive = count_documents(
             es,
             index,
-            [*time_filters, term_filter("attack_type_label", attack_type), term_filter("is_anomaly", -1)],
+            [*time_filters, term_filter("attack_type_label", attack_type), term_filter("is_anomaly", True)],
         )
         false_negative = count_documents(
             es,
             index,
-            [*time_filters, term_filter("attack_type_label", attack_type), term_filter("is_anomaly", 1)],
+            [*time_filters, term_filter("attack_type_label", attack_type), term_filter("is_anomaly", False)],
         )
         true_negative = normal_predicted_normal
         false_positive = normal_anomalies
@@ -173,7 +191,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    es = Elasticsearch(args.elasticsearch_url, request_timeout=30)
+    es = Elasticsearch(**elasticsearch_config(args.elasticsearch_url))
     if not es.ping():
         raise RuntimeError(f"Unable to connect to Elasticsearch at {args.elasticsearch_url}")
 
@@ -188,4 +206,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
