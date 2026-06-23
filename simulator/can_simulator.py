@@ -98,6 +98,7 @@ class CANTelematicsSimulator:
         self.running = True
         self.replay_buffer: Deque[Dict[str, Any]] = deque(maxlen=replay_buffer_size)
         self.replay_cursor = 0
+        self.replay_attack_ticks = 0
 
         self.producer = self._connect_producer(bootstrap_servers, producer_client_id)
 
@@ -245,6 +246,7 @@ class CANTelematicsSimulator:
         frames = []
         replay_batch_size = random.randint(5, 10)
         buffered = list(self.replay_buffer)
+        benchmark_scored = self.replay_attack_ticks >= 5
         for _ in range(replay_batch_size):
             original = json.loads(json.dumps(buffered[self.replay_cursor % len(buffered)]))
             self.replay_cursor += 1
@@ -254,8 +256,11 @@ class CANTelematicsSimulator:
             original["simulator_send_time_ns"] = time.time_ns()
             original["sequence"] = self.tick
             original["attack_type_label"] = "replay"
+            original["attack_phase"] = "replay_attack" if benchmark_scored else "replay_priming"
+            original["benchmark_scored"] = benchmark_scored
             original["replayed_original_sequence"] = original_sequence
             frames.append(original)
+        self.replay_attack_ticks += 1
         return frames
 
     def generate_injection_frames(self) -> List[Dict[str, Any]]:

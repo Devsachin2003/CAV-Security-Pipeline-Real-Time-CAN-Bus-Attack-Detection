@@ -198,8 +198,21 @@ The benchmark runner:
 3. Connects to Kafka using `SASL_SSL`.
 4. Connects to Elasticsearch using basic authentication, with CA verification when `ELASTICSEARCH_URL` uses HTTPS.
 5. Starts the detector against a unique benchmark index.
-6. Runs normal warmup traffic, then fuzz, replay, injection, and DoS traffic.
-7. Runs the evaluator and prints final precision, recall, F1, false-positive rate, accuracy, and per-attack recall.
+6. Creates a unique Kafka benchmark topic unless `--topic` is explicitly provided.
+7. Runs normal warmup traffic, then fuzz, replay, injection, and DoS traffic.
+8. Waits for Kafka consumer lag to reach zero and validates Elasticsearch label counts before evaluation.
+9. Runs the evaluator and enforces quality gates before printing final precision, recall, F1, false-positive rate, accuracy, and per-attack recall.
+
+Default benchmark quality gates:
+
+| Gate | Threshold |
+| --- | --- |
+| Overall F1 | `>= 0.99` |
+| Precision | `>= 0.99` |
+| False-positive rate | `<= 0.005` |
+| Replay recall | `>= 0.99` |
+| Kafka consumer lag | `0` before evaluation |
+| Attack class counts | fuzz, replay, injection, and DoS must all be non-zero |
 
 Reports are written under `reports/`.
 

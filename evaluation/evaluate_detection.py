@@ -25,6 +25,15 @@ from elasticsearch import Elasticsearch
 DEFAULT_ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 DEFAULT_INDEX = "can-security-alerts*"
 ATTACK_TYPES = ["fuzz", "replay", "injection", "dos"]
+SCORED_EVENT_FILTER = {
+    "bool": {
+        "should": [
+            {"bool": {"must_not": [{"exists": {"field": "benchmark_scored"}}]}},
+            {"term": {"benchmark_scored": True}},
+        ],
+        "minimum_should_match": 1,
+    }
+}
 
 
 def elasticsearch_config(url: str) -> Dict[str, Any]:
@@ -87,7 +96,7 @@ def metrics_from_counts(tp: int, tn: int, fp: int, fn: int) -> Dict[str, float]:
 
 
 def evaluate(es: Elasticsearch, index: str, start_time: Optional[str], end_time: Optional[str]) -> Dict[str, Any]:
-    time_filters = range_filter("timestamp", start_time, end_time)
+    time_filters = [SCORED_EVENT_FILTER, *range_filter("timestamp", start_time, end_time)]
 
     normal_total = count_documents(es, index, [*time_filters, term_filter("attack_type_label", "normal")])
     normal_anomalies = count_documents(

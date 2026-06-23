@@ -41,7 +41,7 @@ REPLAY_REPEAT_WINDOW_NS = 3_000_000_000
 REPLAY_REPEAT_MIN_COUNT = 4
 REPLAY_COMPOSITE_THRESHOLD = 0.30
 RARE_REPLAY_COMPOSITE_FLOOR = 0.25
-MODEL_SEVERE_SCORE_THRESHOLD = -0.08
+MODEL_SEVERE_SCORE_THRESHOLD = -0.13
 PAYLOAD_SEQUENCE_LENGTH = 3
 PAYLOAD_SEQUENCE_REPEAT_MIN_COUNT = 2
 PAYLOAD_SEQUENCE_TIGHT_TIMING_RATIO = 0.65
@@ -246,6 +246,8 @@ class CAVIsolationForestDetector:
                     "model_flag": {"type": "boolean"},
                     "rule_flag": {"type": "boolean"},
                     "decision_reasons": {"type": "keyword"},
+                    "benchmark_scored": {"type": "boolean"},
+                    "attack_phase": {"type": "keyword"},
                     "anomaly_score": {"type": "float"},
                     "pipeline_latency_ms": {"type": "float"},
                     "payload": {"type": "object", "enabled": True},
@@ -721,9 +723,28 @@ class CAVIsolationForestDetector:
         return model_prediction == -1 and anomaly_score <= MODEL_SEVERE_SCORE_THRESHOLD
 
     @staticmethod
-    def check_replay_anomaly(features: Dict[str, float]) -> Optional[str]:
-        if features["payload_sequence_replay_score"] >= 0.80:
+    def check_replay_anomaly(features: Dict[str, float], model_prediction: int = 1) -> Optional[str]:
+        if features["payload_sequence_replay_score"] >= 0.70:
             return "payload_ngram_replay_tight_timing"
+        if (
+            model_prediction == -1
+            and features["payload_sequence_repeat_count"] >= 1
+            and features["payload_signature_repeats_3s"] >= 1
+        ):
+            return "replay_sequence_model_repeat_confluence"
+        if (
+            features["payload_sequence_repeat_count"] >= 1
+            and features["rare_transition_flag"]
+            and features["payload_signature_repeats_3s"] >= 1
+            and features["timing_anomaly_score"] >= 0.95
+        ):
+            return "replay_sequence_rare_timing_confluence"
+        if (
+            model_prediction == -1
+            and features["payload_sequence_repeat_count"] >= 1
+            and features["timing_anomaly_score"] >= 0.95
+        ):
+            return "replay_sequence_model_timing_confluence"
         if features["payload_sequence_repeat_count"] >= 3 and features["payload_sequence_tight_timing_flag"]:
             return "repeated_payload_sequence_tight_timing"
         if (
@@ -735,7 +756,11 @@ class CAVIsolationForestDetector:
         return None
 
     @staticmethod
-    def apply_security_rules(frame: Dict[str, Any], features: Dict[str, float]) -> Tuple[List[str], float]:
+    def apply_security_rules(
+        frame: Dict[str, Any],
+        features: Dict[str, float],
+        model_prediction: int = 1,
+    ) -> Tuple[List[str], float]:
         payload = frame.get("payload", {})
         if not isinstance(payload, dict):
             payload = {}
@@ -781,7 +806,7 @@ class CAVIsolationForestDetector:
             and features["payload_timing_replay_score"] >= RARE_REPLAY_COMPOSITE_FLOOR
         ):
             rules.append("rare_sequence_replay_timing")
-        replay_rule = CAVIsolationForestDetector.check_replay_anomaly(features)
+        replay_rule = CAVIsolationForestDetector.check_replay_anomaly(features, model_prediction)
         if replay_rule:
             rules.append(replay_rule)
         if features["state_transition_violation_score"] >= 0.5:
@@ -818,7 +843,7 @@ class CAVIsolationForestDetector:
             phase = "warmup"
         else:
             model_prediction, score = self.infer(vector)
-            triggered_rules, rule_score = self.apply_security_rules(frame, features)
+            triggered_rules, rule_score = self.apply_security_rules(frame, features, model_prediction)
             model_flag = self._model_flag(model_prediction, score)
             rule_flag = bool(triggered_rules)
             phase = "inference"

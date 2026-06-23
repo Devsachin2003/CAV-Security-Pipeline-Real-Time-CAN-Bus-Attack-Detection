@@ -22,7 +22,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from elasticsearch import Elasticsearch
 from kafka import KafkaConsumer, TopicPartition
-from kafka.admin import KafkaAdminClient
+from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import KafkaError, NoBrokersAvailable
 
 
@@ -136,6 +136,22 @@ def verify_kafka(topic: str, timeout_seconds: int = 60, retry_interval_seconds: 
     raise RuntimeError(f"Kafka did not become ready within {timeout_seconds}s") from last_error
 
 
+def ensure_kafka_topic(topic: str, partitions: int = 3, replication_factor: int = 1) -> None:
+    admin = KafkaAdminClient(**kafka_config())
+    try:
+        topics = set(admin.list_topics())
+        if topic in topics:
+            print(f"Kafka topic '{topic}' already exists.", flush=True)
+            return
+        admin.create_topics(
+            [NewTopic(name=topic, num_partitions=partitions, replication_factor=replication_factor)],
+            validate_only=False,
+        )
+        print(f"Created Kafka benchmark topic '{topic}'.", flush=True)
+    finally:
+        admin.close()
+
+
 def verify_elasticsearch() -> None:
     es = Elasticsearch(**elasticsearch_config())
     try:
@@ -158,6 +174,7 @@ def clean_index(index_name: str) -> None:
 
 
 def start_detector(
+    topic: str,
     index_name: str,
     warmup_samples: int,
     consumer_group: str,
@@ -167,6 +184,8 @@ def start_detector(
     command = [
         sys.executable,
         "detection/ml_detector.py",
+        "--topic",
+        topic,
         "--warmup-samples",
         str(warmup_samples),
         "--consumer-group",
@@ -198,10 +217,19 @@ def parse_published_count(log_path: Path) -> int:
     return 0
 
 
-def run_simulator(mode: str, rate_hz: float, duration_seconds: int, env: Dict[str, str], log_path: Path) -> int:
+def run_simulator(
+    topic: str,
+    mode: str,
+    rate_hz: float,
+    duration_seconds: int,
+    env: Dict[str, str],
+    log_path: Path,
+) -> int:
     command = [
         sys.executable,
         "simulator/can_simulator.py",
+        "--topic",
+        topic,
         "--attack-mode",
         mode,
         "--rate-hz",
@@ -259,32 +287,42 @@ def run_evaluation(index_name: str, json_out: Path, csv_out: Path, env: Dict[str
     return json.loads(json_out.read_text(encoding="utf-8"))
 
 
-def consumer_lag(topic: str, consumer_group: str) -> Tuple[int, Dict[str, int]]:
-    consumer = KafkaConsumer(
-        group_id=consumer_group,
-        enable_auto_commit=False,
-        **kafka_config(),
-    )
-    try:
-        partitions = consumer.partitions_for_topic(topic)
-        if not partitions:
-            raise RuntimeError(f"Kafka topic '{topic}' has no partitions visible to the lag checker.")
+def consumer_lag(topic: str, consumer_group: str, attempts: int = 5) -> Tuple[int, Dict[str, int]]:
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        consumer: Optional[KafkaConsumer] = None
+        try:
+            consumer = KafkaConsumer(
+                group_id=consumer_group,
+                enable_auto_commit=False,
+                **kafka_config(),
+            )
+            partitions = consumer.partitions_for_topic(topic)
+            if not partitions:
+                raise RuntimeError(f"Kafka topic '{topic}' has no partitions visible to the lag checker.")
 
-        topic_partitions = [TopicPartition(topic, partition) for partition in sorted(partitions)]
-        end_offsets = consumer.end_offsets(topic_partitions)
-        lag_by_partition: Dict[str, int] = {}
-        total_lag = 0
-        for topic_partition in topic_partitions:
-            committed = consumer.committed(topic_partition)
-            if committed is None:
-                committed = 0
-            lag = max(0, int(end_offsets[topic_partition]) - int(committed))
-            key = f"{topic_partition.topic}-{topic_partition.partition}"
-            lag_by_partition[key] = lag
-            total_lag += lag
-        return total_lag, lag_by_partition
-    finally:
-        consumer.close()
+            topic_partitions = [TopicPartition(topic, partition) for partition in sorted(partitions)]
+            end_offsets = consumer.end_offsets(topic_partitions)
+            lag_by_partition: Dict[str, int] = {}
+            total_lag = 0
+            for topic_partition in topic_partitions:
+                committed = consumer.committed(topic_partition)
+                if committed is None:
+                    committed = 0
+                lag = max(0, int(end_offsets[topic_partition]) - int(committed))
+                key = f"{topic_partition.topic}-{topic_partition.partition}"
+                lag_by_partition[key] = lag
+                total_lag += lag
+            return total_lag, lag_by_partition
+        except (NoBrokersAvailable, KafkaError, OSError, ConnectionError) as exc:
+            last_error = exc
+            print(f"Kafka lag check failed attempt {attempt}/{attempts}: {exc}", flush=True)
+            time.sleep(min(2 * attempt, 10))
+        finally:
+            if consumer is not None:
+                consumer.close()
+
+    raise RuntimeError("Unable to check Kafka consumer lag after retries") from last_error
 
 
 def label_counts(index_name: str) -> Dict[str, int]:
@@ -356,6 +394,24 @@ def validate_report(report: Dict[str, object], label_count_map: Dict[str, int], 
         raise RuntimeError(f"Evaluation report has zero totals for attack classes: {zero_total}")
 
 
+def validate_quality_gates(report: Dict[str, object], args: argparse.Namespace) -> None:
+    overall = report["overall"]
+    replay = report["per_attack"]["replay"]
+    failures = []
+    if overall["f1"] < args.min_overall_f1:
+        failures.append(f"overall_f1 {overall['f1']:.4%} < {args.min_overall_f1:.4%}")
+    if overall["precision"] < args.min_precision:
+        failures.append(f"precision {overall['precision']:.4%} < {args.min_precision:.4%}")
+    if overall["false_positive_rate"] > args.max_false_positive_rate:
+        failures.append(
+            f"false_positive_rate {overall['false_positive_rate']:.4%} > {args.max_false_positive_rate:.4%}"
+        )
+    if replay["recall"] < args.min_replay_recall:
+        failures.append(f"replay_recall {replay['recall']:.4%} < {args.min_replay_recall:.4%}")
+    if failures:
+        raise RuntimeError("Benchmark quality gates failed: " + "; ".join(failures))
+
+
 def print_metrics(report: Dict[str, object]) -> None:
     overall = report["overall"]
     per_attack = report["per_attack"]
@@ -383,7 +439,7 @@ def benchmark_modes(args: argparse.Namespace) -> Iterable[tuple[str, float, int]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an end-to-end secured CAV pipeline benchmark.")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
-    parser.add_argument("--topic", default=DEFAULT_TOPIC)
+    parser.add_argument("--topic", help="Kafka topic to use. Defaults to a unique benchmark topic per run.")
     parser.add_argument("--index-name", default=f"can-security-alerts-benchmark-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
     parser.add_argument("--warmup-samples", type=int, default=1000)
     parser.add_argument("--detector-startup-seconds", type=int, default=8)
@@ -395,6 +451,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dos-rate-hz", type=float, default=10.0)
     parser.add_argument("--drain-timeout-seconds", type=int, default=180)
     parser.add_argument("--drain-poll-seconds", type=int, default=3)
+    parser.add_argument("--min-overall-f1", type=float, default=0.99)
+    parser.add_argument("--min-precision", type=float, default=0.99)
+    parser.add_argument("--max-false-positive-rate", type=float, default=0.005)
+    parser.add_argument("--min-replay-recall", type=float, default=0.99)
     parser.add_argument("--skip-docker-ps", action="store_true")
     parser.add_argument("--keep-index", action="store_true")
     return parser.parse_args()
@@ -406,6 +466,7 @@ def main() -> int:
     env = os.environ.copy()
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    topic = args.topic or f"{DEFAULT_TOPIC}-benchmark-{run_id}"
     consumer_group = f"cav-security-benchmark-{run_id}"
     detector_log = REPORTS_DIR / f"benchmark-detector-{run_id}.log"
     json_out = REPORTS_DIR / f"benchmark-evaluation-{run_id}.json"
@@ -413,22 +474,23 @@ def main() -> int:
 
     if not args.skip_docker_ps:
         verify_docker_services()
-    verify_kafka(args.topic)
+    ensure_kafka_topic(topic)
+    verify_kafka(topic)
     verify_elasticsearch()
     if not args.keep_index:
         clean_index(args.index_name)
 
-    detector = start_detector(args.index_name, args.warmup_samples, consumer_group, env, detector_log)
+    detector = start_detector(topic, args.index_name, args.warmup_samples, consumer_group, env, detector_log)
     try:
         time.sleep(args.detector_startup_seconds)
         produced_counts: Dict[str, int] = {}
         for mode, rate_hz, duration in benchmark_modes(args):
             log_path = REPORTS_DIR / f"benchmark-simulator-{mode}-{run_id}.log"
-            produced_counts[mode] = run_simulator(mode, rate_hz, duration, env, log_path)
+            produced_counts[mode] = run_simulator(topic, mode, rate_hz, duration, env, log_path)
         expected_total = sum(produced_counts.values())
         print(f"Produced frame counts: {produced_counts}; total={expected_total}", flush=True)
         counts = wait_for_benchmark_drain(
-            args.topic,
+            topic,
             consumer_group,
             args.index_name,
             expected_total,
@@ -438,6 +500,7 @@ def main() -> int:
         print(f"Validated Elasticsearch label counts before evaluation: {counts}", flush=True)
         report = run_evaluation(args.index_name, json_out, csv_out, env)
         validate_report(report, counts, expected_total)
+        validate_quality_gates(report, args)
         print_metrics(report)
     finally:
         terminate_process(detector)
